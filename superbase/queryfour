@@ -1,0 +1,26 @@
+begin;
+
+alter table companies
+add column if not exists openregister_financials_date text;
+
+update companies c
+set openregister_financials_date = latest.indicator_date
+from (
+    select
+        c2.openregister_company_id,
+        ind.value ->> 'date' as indicator_date
+    from companies c2
+    cross join lateral (
+        select value
+        from jsonb_array_elements(coalesce(c2.raw_company_details -> 'indicators', '[]'::jsonb))
+        order by value ->> 'date' desc nulls last
+        limit 1
+    ) ind
+) latest
+where c.openregister_company_id = latest.openregister_company_id
+  and c.openregister_financials_date is null
+  and latest.indicator_date is not null;
+
+notify pgrst, 'reload schema';
+
+commit;

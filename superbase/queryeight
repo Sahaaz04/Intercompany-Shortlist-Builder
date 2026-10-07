@@ -1,0 +1,255 @@
+begin;
+
+drop view if exists master_overview;
+
+-- ============================================================
+-- 1. company_management table
+-- Current authorized representatives (directors / officers / signatories)
+-- pulled from OpenRegister company details -> representation[].
+-- Structurally mirrors company_ubos.
+-- ============================================================
+
+create table if not exists company_management (
+    id uuid primary key default gen_random_uuid(),
+
+    company_register_id text not null references companies(register_id) on delete cascade,
+    openregister_company_id text not null references companies(openregister_company_id) on delete cascade,
+    company_name text,
+
+    management_key text not null,
+    management_id text,
+    management_name text,
+
+    role text,
+    management_type text,
+
+    natural_person_full_name text,
+    natural_person_first_name text,
+    natural_person_last_name text,
+    date_of_birth text,
+    age integer,
+
+    legal_person_name text,
+    management_city text,
+    management_country text,
+
+    authority text,
+    start_date text,
+    end_date text,
+
+    api_status text,
+    notes text,
+
+    enriched_at timestamptz default now(),
+    updated_at timestamptz default now(),
+
+    raw_data jsonb,
+
+    unique(openregister_company_id, management_key)
+);
+
+create index if not exists company_management_company_register_id_idx
+on company_management(company_register_id);
+
+create index if not exists company_management_openregister_company_id_idx
+on company_management(openregister_company_id);
+
+create index if not exists company_management_name_idx
+on company_management(management_name);
+
+-- ============================================================
+-- 2. Management aggregate columns on companies
+-- ============================================================
+
+alter table companies add column if not exists management_enriched_at timestamptz;
+alter table companies add column if not exists number_of_management integer;
+alter table companies add column if not exists natural_person_management_count integer;
+alter table companies add column if not exists legal_person_management_count integer;
+alter table companies add column if not exists youngest_management_age integer;
+alter table companies add column if not exists oldest_management_age integer;
+
+with mgmt_agg as (
+    select
+        m.openregister_company_id,
+        count(*) as total_management,
+        count(*) filter (where m.management_type = 'natural_person') as natural_count,
+        count(*) filter (where m.management_type = 'legal_person') as legal_count,
+        min(m.age) as youngest_age,
+        max(m.age) as oldest_age
+    from company_management m
+    group by m.openregister_company_id
+)
+update companies c set
+    number_of_management = mgmt_agg.total_management,
+    natural_person_management_count = mgmt_agg.natural_count,
+    legal_person_management_count = mgmt_agg.legal_count,
+    youngest_management_age = mgmt_agg.youngest_age,
+    oldest_management_age = mgmt_agg.oldest_age
+from mgmt_agg
+where c.openregister_company_id = mgmt_agg.openregister_company_id;
+
+-- ============================================================
+-- 3. Rebuild master_overview with management columns
+--    positioned right before the shareholder columns.
+-- ============================================================
+
+create view master_overview as
+select
+    c.register_id,
+    c.openregister_company_id,
+    c.name as company_name,
+    c.legal_form,
+    c.founding_year,
+    c.active,
+    c.country,
+    c.register_number,
+    c.register_court,
+    c.register_type,
+
+    c.city,
+    c.postal_code,
+    c.website,
+    c.email,
+
+    c.purpose,
+
+    c.openregister_wz_codes,
+    c.northdata_wz_code,
+
+    c.openregister_revenue_eur,
+    c.northdata_revenue_eur,
+
+    c.northdata_employees,
+    c.openregister_employees,
+
+    c.northdata_balance_sheet_total_eur,
+    c.openregister_balance_sheet_total_eur,
+
+    c.northdata_net_income_eur,
+    c.openregister_net_income_eur,
+
+    c.northdata_equity_eur,
+    c.openregister_equity_eur,
+
+    c.northdata_cash_eur,
+    c.openregister_cash_eur,
+
+    c.northdata_liabilities_eur,
+    c.openregister_liabilities_eur,
+
+    c.northdata_real_estate_eur,
+    c.openregister_real_estate_eur,
+
+    c.northdata_capital_amount_eur,
+    c.openregister_capital_amount_eur,
+
+    c.financials_date,
+    c.openregister_financials_date,
+
+    -- Management aggregates + main management person (before shareholders)
+    c.number_of_management,
+    c.natural_person_management_count,
+    c.legal_person_management_count,
+    c.youngest_management_age,
+    c.oldest_management_age,
+
+    main_management.management_name as main_management_name,
+    main_management.role as main_management_role,
+    main_management.age as main_management_age,
+
+    c.number_of_owners,
+    c.natural_person_owner_count,
+    c.legal_person_owner_count,
+    c.youngest_owner_age,
+    c.oldest_owner_age,
+    c.has_sole_owner,
+    c.has_representative_owner,
+    c.is_family_owned,
+    c.has_majority_owner,
+    c.largest_owner_percentage,
+
+    c.number_of_ubos,
+    c.natural_person_ubo_count,
+    c.legal_person_ubo_count,
+    c.youngest_ubo_age,
+    c.oldest_ubo_age,
+
+    main_owner.shareholder_name as main_owner_name,
+    main_owner.owner_type as main_owner_type,
+    main_owner.percentage_share as main_owner_percentage_share,
+
+    main_ubo.ubo_name as main_ubo_name,
+    main_ubo.age as main_ubo_age,
+    main_ubo.percentage_share as main_ubo_percentage_share,
+    main_ubo.max_percentage_share as main_ubo_max_percentage_share,
+
+    cm.business_segment as claude_business_segment,
+    cm.business_segment_2 as claude_business_segment_2,
+    cm.business_model as claude_business_model,
+    cm.summary as claude_detailed_business_summary,
+
+    fs.fit_score,
+    fs.fit_label,
+    fs.fit_comment
+
+from companies c
+
+left join lateral (
+    select
+        m.management_name,
+        m.role,
+        m.age
+    from company_management m
+    where m.openregister_company_id = c.openregister_company_id
+      and coalesce(m.management_name, '') <> ''
+    order by m.enriched_at desc
+    limit 1
+) main_management on true
+
+left join lateral (
+    select
+        sh.shareholder_name,
+        sh.owner_type,
+        sh.percentage_share
+    from shareholders sh
+    where sh.openregister_company_id = c.openregister_company_id
+      and coalesce(sh.shareholder_name, '') <> ''
+    order by sh.percentage_share desc nulls last, sh.retrieved_at desc
+    limit 1
+) main_owner on true
+
+left join lateral (
+    select
+        u.ubo_name,
+        u.age,
+        u.percentage_share,
+        u.max_percentage_share
+    from company_ubos u
+    where u.openregister_company_id = c.openregister_company_id
+    order by coalesce(u.percentage_share, u.max_percentage_share) desc nulls last, u.enriched_at desc
+    limit 1
+) main_ubo on true
+
+left join lateral (
+    select *
+    from company_models cm
+    where cm.openregister_company_id = c.openregister_company_id
+       or cm.company_register_id = c.register_id
+    order by coalesce(cm.updated_at, cm.created_at) desc nulls last
+    limit 1
+) cm on true
+
+left join lateral (
+    select *
+    from company_fit_scores fs
+    where fs.openregister_company_id = c.openregister_company_id
+       or fs.company_register_id = c.register_id
+    order by coalesce(fs.updated_at, fs.created_at) desc nulls last
+    limit 1
+) fs on true;
+
+grant select on table master_overview to anon, authenticated;
+
+notify pgrst, 'reload schema';
+
+commit;
